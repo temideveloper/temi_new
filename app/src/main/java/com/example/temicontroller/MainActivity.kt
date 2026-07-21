@@ -6,6 +6,7 @@ import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
@@ -25,12 +26,9 @@ import com.example.temicontroller.databinding.ActivityMainBinding
 import com.example.temicontroller.models.ZoneDefaults
 import com.robotemi.sdk.Robot
 import com.robotemi.sdk.TtsRequest
-import com.robotemi.sdk.map.Layer
-import com.robotemi.sdk.map.MapDataModel
 import com.robotemi.sdk.permission.Permission
 import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 import kotlinx.coroutines.launch
 import java.io.ByteArrayOutputStream
 
@@ -52,7 +50,7 @@ class MainActivity : AppCompatActivity() {
     // Map publisher (less frequent)
     private var mapHandler: Handler? = null
     private var mapRunnable: Runnable? = null
-    private val MAP_PUBLISH_INTERVAL_MS = 30000L  // Every 30 seconds
+    private val MAP_PUBLISH_INTERVAL_MS = 2000L  // Every 2 seconds
 
     companion object {
         const val TAG = "TemiFace"
@@ -68,11 +66,9 @@ class MainActivity : AppCompatActivity() {
         const val KEY_DETECT_UNATTENDED_BAG = "detect_unattended_bag"
         const val KEY_DETECT_UNAUTHORIZED = "detect_unauthorized"
         const val KEY_ZONES_JSON = "zones_json"
-        const val TARGET_MAP_NAME = "eunos1"
     }
     
     // Map data listener - receives map when SDK loads it asynchronously
-    private var mapDataModel: MapDataModel? = null
     
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
@@ -84,11 +80,13 @@ class MainActivity : AppCompatActivity() {
             startPositionPublishing()
             startMapPublishing()
             
-            // Publish locations after MQTT connects
+            // Publish locations after MQTT connects (with a small delay to allow map to load)
             mqttService?.onMqttConnected = {
-                robot?.let { r ->
-                    publishLocationsWithCoordinates(r)
-                }
+                Handler(mainLooper).postDelayed({
+                    robot?.let { r ->
+                        publishLocationsWithCoordinates(r)
+                    }
+                }, 2000) // 2 second delay for map initialization
             }
         }
         override fun onServiceDisconnected(name: ComponentName?) {
@@ -99,60 +97,52 @@ class MainActivity : AppCompatActivity() {
     private fun publishLocationsWithCoordinates(r: Robot) {
         GlobalScope.launch(Dispatchers.Main) {
             try {
-                val locationNames = r.locations
-                Log.d(TAG, "Locations: ${locationNames.size}, Names: $locationNames")
-                
-                if (locationNames.isEmpty()) {
-                    Log.w(TAG, "No locations found")
-                    return@launch
+                val robotId = r.serialNumber ?: "unknown"
+                // Ensure MAP permission is granted
+                if (r.checkSelfPermission(Permission.MAP) != Permission.GRANTED) {
+                    Log.w(TAG, "Map permission not granted. Cannot fetch locations.")
                 }
-                
-                // Try multiple strategies to get location coordinates
-                val locationsWithCoords = try {
-                    // Strategy 1: Try getCurrentFloor() first
-                    val currentFloor = r.getCurrentFloor()
-                    if (currentFloor != null && currentFloor.locations.isNotEmpty()) {
-                        val floorLocations: List<com.robotemi.sdk.map.Location> = currentFloor.locations
-                        Log.d(TAG, "Floor locations count: ${floorLocations.size}")
-                        
-                        val locationMap = floorLocations.associate { loc ->
-                            loc.name to mapOf(
-                                "id" to loc.name,
-                                "name" to loc.name,
-                                "x" to loc.x,
-                                "y" to loc.y,
-                                "yaw" to loc.yaw,
-                                "tiltAngle" to loc.tiltAngle,
-                                "source" to "floor"
-                            )
-                        }
-                        
-                        Log.d(TAG, "Location map keys: ${locationMap.keys}")
-                        
-                        locationNames.map { locName ->
-                            locationMap[locName] ?: run {
-                                Log.w(TAG, "No floor coords for '$locName', using ContentProvider")
-                                queryLocationFromContentProvider(locName, r)
+
+                val mapData = r.getMapData()
+                val extractedLocations = mutableListOf<Map<String, Any>>()
+                val extractedWalls = mutableListOf<Map<String, Any>>()
+
+                if (mapData != null) {
+                    // Filter for Locations (Category 4)
+                    mapData.locations.forEach { layer ->
+                        if (layer.layerCategory == 4) {
+                            layer.layerPoses?.forEach { pose ->
+                                extractedLocations.add(mapOf(
+                                    "id" to layer.layerId,
+                                    "name" to layer.layerId,
+                                    "x" to pose.x,
+                                    "y" to pose.y,
+                                    "yaw" to pose.theta
+                                ))
                             }
                         }
-                    } else {
-                        // Strategy 2: Fall back to ContentProvider for each location
-                        Log.w(TAG, "No floor data, fetching locations via ContentProvider")
-                        locationNames.map { locName ->
-                            queryLocationFromContentProvider(locName, r)
+                    }
+
+                    // Filter for Virtual Walls (Category 3)
+                    val allWallLayers = mapData.virtualWalls + mapData.locations.filter { it.layerCategory == 3 }
+                    allWallLayers.forEach { layer ->
+                        if (layer.layerCategory == 3) {
+                            val points = layer.layerPoses?.map { mapOf("x" to it.x, "y" to it.y) } ?: emptyList()
+                            if (points.isNotEmpty()) {
+                                extractedWalls.add(mapOf(
+                                    "id" to layer.layerId,
+                                    "points" to points
+                                ))
+                            }
                         }
                     }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error reading floor data: ${e.message}, using ContentProvider")
-                    locationNames.map { locName ->
-                        queryLocationFromContentProvider(locName, r)
-                    }
                 }
-                
-                mqttService?.publishLocations(locationsWithCoords)
-                Log.d(TAG, "Published ${locationsWithCoords.size} locations with coordinates")
+
+                mqttService?.publishLocations(robotId, extractedLocations)
+                mqttService?.publishVirtualWalls(robotId, extractedWalls)
+                Log.d(TAG, "Published ${extractedLocations.size} locations and ${extractedWalls.size} walls")
             } catch (e: Exception) {
-                Log.e(TAG, "Error publishing locations", e)
+                Log.e(TAG, "Error publishing locations/walls", e)
             }
         }
     }
@@ -161,13 +151,13 @@ class MainActivity : AppCompatActivity() {
     private fun queryLocationFromContentProvider(locName: String, r: Robot): Map<String, Any> {
         return try {
             val uri = android.net.Uri.parse("content://com.robotemi.sdk.provider/map/location")
-            val projection = arrayOf("name", "x", "y", "yaw")
-            val selection = "name = ?"
-            val selectionArgs = arrayOf(locName)
+            // Try name and location_name columns for compatibility
+            val projection = arrayOf("name", "location_name", "x", "y", "yaw")
+            val selection = "name = ? OR location_name = ?"
+            val selectionArgs = arrayOf(locName, locName)
             
             contentResolver.query(uri, projection, selection, selectionArgs, null)?.use { cursor ->
                 if (cursor.moveToFirst()) {
-                    val nameIdx = cursor.getColumnIndex("name")
                     val xIdx = cursor.getColumnIndex("x")
                     val yIdx = cursor.getColumnIndex("y")
                     val yawIdx = cursor.getColumnIndex("yaw")
@@ -176,22 +166,21 @@ class MainActivity : AppCompatActivity() {
                     val y = if (yIdx >= 0) cursor.getFloat(yIdx) else 0f
                     val yaw = if (yawIdx >= 0) cursor.getFloat(yawIdx) else 0f
                     
-                    Log.d(TAG, "ContentProvider('$locName') -> x=$x, y=$y, yaw=$yaw")
+                    Log.d(TAG, "ContentProvider success for '$locName' -> x=$x, y=$y")
                     return mapOf(
                         "id" to locName,
                         "name" to locName,
                         "x" to x,
                         "y" to y,
                         "yaw" to yaw,
-                        "tiltAngle" to 0f,
                         "source" to "content_provider"
                     )
                 }
             }
             
-            // ContentProvider failed — last resort: use robot position
-            Log.w(TAG, "ContentProvider returned no data for '$locName', using robot position")
+            // Real fallback: return current robot position only if totally lost
             val pos = r.getPosition()
+            Log.w(TAG, "No data for '$locName', using robot position fallback")
             mapOf(
                 "id" to locName,
                 "name" to locName,
@@ -225,29 +214,29 @@ class MainActivity : AppCompatActivity() {
         robot?.let { r ->
             r.addOnCurrentPositionChangedListener(positionListener)
             r.addOnLocationsUpdatedListener(locationsListener)
+            r.addOnMapNameChangedListener(mapNameListener)
+            r.addOnMapElementsChangedListener(mapElementsListener)
             r.addOnGoToLocationStatusChangedListener(goToStatusListener)
-            Log.d(TAG, "Added position, locations, and goTo status listeners")
+            Log.d(TAG, "Added position, locations, map, and goTo status listeners")
             
             // Request MAP permission (required for SDK content provider to serve maps)
-            if (r.checkSelfPermission(Permission.MAP) != PackageManager.PERMISSION_GRANTED) {
+            if (r.checkSelfPermission(Permission.MAP) != Permission.GRANTED) {
                 Log.d(TAG, "MAP permission not granted, requesting...")
                 r.requestPermissions(listOf(Permission.MAP), 1)
             } else {
                 Log.d(TAG, "MAP permission already granted")
             }
-            
-            // Try to load the target map immediately (use the 3-arg form from working app)
-            Log.d(TAG, "Attempting to load map: $TARGET_MAP_NAME")
-            try {
-                r.loadMap(TARGET_MAP_NAME, false, null)
-                Log.d(TAG, "loadMap('$TARGET_MAP_NAME', false, null) called")
-            } catch (e: Exception) {
-                Log.e(TAG, "loadMap failed: ${e.message}")
-            }
         }
         
         // Start MQTT service
         startMqttService()
+        
+        // Request POST_NOTIFICATIONS for Android 13+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 101)
+            }
+        }
         
         // Set initial face
         binding.faceView.setState(FaceView.FaceState.IDLE)
@@ -315,53 +304,32 @@ class MainActivity : AppCompatActivity() {
                     if (location != null) {
                         // Ensure map is loaded before navigating
                         val mapData = robot?.getMapData()
-                        if (mapData == null || mapData.mapImage == null || mapData.mapImage.cols == 0) {
-                            Log.w(TAG, "Map not loaded yet, loading $TARGET_MAP_NAME before navigation")
-                            try {
-                                robot?.loadMap(TARGET_MAP_NAME, false, null)
-                                // Wait briefly then retry
-                                Handler(mainLooper).postDelayed({
-                                    val location2 = params["location"]
-                                    robot?.let { r ->
-                                        val locations2 = r.locations
-                                        if (locations2.isEmpty() || locations2.contains(location2)) {
-                                            binding.faceView.setState(FaceView.FaceState.MOVING)
-                                            r.goTo(location2!!)
-                                            speak("Going to $location2")
-                                            Log.d(TAG, "Navigating (after map load) to: $location2")
-                                            resetFaceAfterDelay()
-                                        } else {
-                                            binding.faceView.setState(FaceView.FaceState.CONFUSED)
-                                            speak("Location $location2 not found")
-                                            Handler(mainLooper).postDelayed({
-                                                binding.faceView.setState(FaceView.FaceState.IDLE)
-                                            }, 3000)
-                                        }
-                                    }
-                                }, 2000)
-                            } catch (e: Exception) {
-                                Log.e(TAG, "Failed to load map: ${e.message}")
-                                binding.faceView.setState(FaceView.FaceState.CONFUSED)
-                                speak("Map not available")
-                                mqttService?.publishCommand("navigation_error", mapOf(
-                                    "error" to "map_not_loaded",
-                                    "requested" to location
-                                ))
-                                Handler(mainLooper).postDelayed({
-                                    binding.faceView.setState(FaceView.FaceState.IDLE)
-                                }, 3000)
-                            }
+                        if (mapData == null || mapData.mapId.isEmpty() || mapData.mapImage.cols == 0) {
+                            Log.w(TAG, "Map not loaded yet. Cannot navigate to $location")
+                            binding.faceView.setState(FaceView.FaceState.CONFUSED)
+                            speak("Map not loaded. Please select a map on the robot.")
+                            mqttService?.publishCommand("navigation_error", mapOf(
+                                "error" to "map_not_loaded",
+                                "requested" to location
+                            ))
+                            Handler(mainLooper).postDelayed({
+                                binding.faceView.setState(FaceView.FaceState.IDLE)
+                            }, 3000)
                             return@runOnUiThread
                         }
                         
                         // Map is loaded, validate location
                         val knownLocations = robot?.locations ?: emptyList()
-                        if (knownLocations.isEmpty() || knownLocations.contains(location)) {
+                        if (knownLocations.isNotEmpty() && knownLocations.contains(location)) {
                             binding.faceView.setState(FaceView.FaceState.MOVING)
                             robot?.goTo(location)
                             speak("Going to $location")
-                            Log.d(TAG, "Navigating to: $location (locations: $knownLocations)")
+                            Log.d(TAG, "Navigating to: $location")
                             resetFaceAfterDelay()
+                        } else if (knownLocations.isEmpty()) {
+                            // Fallback: try anyway if list is empty but map is loaded
+                            robot?.goTo(location)
+                            Log.w(TAG, "Locations list empty, attempting navigation to $location anyway")
                         } else {
                             binding.faceView.setState(FaceView.FaceState.CONFUSED)
                             speak("Location $location not found on map")
@@ -422,40 +390,18 @@ class MainActivity : AppCompatActivity() {
                     if (x != null && y != null) {
                         try {
                             val mapData = robot?.getMapData()
-                            if (mapData == null || mapData.mapImage == null || mapData.mapImage.cols == 0) {
-                                Log.w(TAG, "Map not loaded yet, loading $TARGET_MAP_NAME before navigation")
-                                try {
-                                    robot?.loadMap(TARGET_MAP_NAME, false, null)
-                                    Handler(mainLooper).postDelayed({
-                                        val xStr2 = params["x"]
-                                        val yStr2 = params["y"]
-                                        val thetaStr2 = params["theta"]
-                                        val x2 = xStr2?.toDoubleOrNull()?.toFloat()
-                                        val y2 = yStr2?.toDoubleOrNull()?.toFloat()
-                                        val theta2 = thetaStr2?.toDoubleOrNull()?.toFloat() ?: 0f
-
-                                        if (x2 != null && y2 != null) {
-                                            binding.faceView.setState(FaceView.FaceState.MOVING)
-                                            val position = com.robotemi.sdk.navigation.model.Position(x2, y2, theta2)
-                                            robot?.goToPosition(position)
-                                            speak("Going to position ${x2.toInt()}, ${y2.toInt()}")
-                                            Log.d(TAG, "Navigating (after map load) to position: x=$x2, y=$y2, theta=$theta2")
-                                            resetFaceAfterDelay()
-                                        }
-                                    }, 2000)
-                                } catch (e: Exception) {
-                                    Log.e(TAG, "Failed to load map: ${e.message}")
-                                    binding.faceView.setState(FaceView.FaceState.CONFUSED)
-                                    speak("Map not available")
-                                    mqttService?.publishCommand("navigation_error", mapOf(
-                                        "error" to "map_not_loaded",
-                                        "requested_x" to x.toString(),
-                                        "requested_y" to y.toString()
-                                    ))
-                                    Handler(mainLooper).postDelayed({
-                                        binding.faceView.setState(FaceView.FaceState.IDLE)
-                                    }, 3000)
-                                }
+                            if (mapData == null || mapData.mapId.isEmpty() || mapData.mapImage.cols == 0) {
+                                Log.w(TAG, "Map not loaded yet. Cannot navigate to coordinates.")
+                                binding.faceView.setState(FaceView.FaceState.CONFUSED)
+                                speak("Map not loaded. Please select a map on the robot.")
+                                mqttService?.publishCommand("navigation_error", mapOf(
+                                    "error" to "map_not_loaded",
+                                    "requested_x" to x.toString(),
+                                    "requested_y" to y.toString()
+                                ))
+                                Handler(mainLooper).postDelayed({
+                                    binding.faceView.setState(FaceView.FaceState.IDLE)
+                                }, 3000)
                                 return@runOnUiThread
                             }
 
@@ -843,8 +789,9 @@ class MainActivity : AppCompatActivity() {
                 mapHandler?.postDelayed(this, MAP_PUBLISH_INTERVAL_MS)
             }
         }
-        mapHandler?.post(mapRunnable!!)
-        Log.d(TAG, "Started map publishing every ${MAP_PUBLISH_INTERVAL_MS}ms")
+        // Delayed start to give SDK time to initialize
+        mapHandler?.postDelayed(mapRunnable!!, 5000)
+        Log.d(TAG, "Map publishing scheduled with 5s delay")
     }
     
     private fun startPositionPublishing() {
@@ -862,151 +809,65 @@ class MainActivity : AppCompatActivity() {
     private fun publishCurrentPosition() {
         robot?.let { r ->
             try {
+                val robotId = r.serialNumber ?: "unknown"
                 val position = r.getPosition()
-                mqttService?.publishPosition(position.x, position.y, position.yaw)
+                mqttService?.publishPosition(robotId, position.x, position.y, position.yaw)
                 Log.d(TAG, "Periodic position published: x=${position.x}, y=${position.y}, yaw=${position.yaw}")
             } catch (e: Exception) {
                 Log.e(TAG, "Error publishing periodic position", e)
             }
         }
     }
-    
+
+    private fun compressGzip(data: List<Int>): String {
+        val byteArray = data.map { it.toByte() }.toByteArray()
+        val bos = java.io.ByteArrayOutputStream()
+        java.util.zip.GZIPOutputStream(bos).use { it.write(byteArray) }
+        return Base64.encodeToString(bos.toByteArray(), Base64.NO_WRAP)
+    }
+
     private fun publishMapData() {
         robot?.let { r ->
             try {
-                // If we already have cached map data, use it directly
-                var cachedMapData = this.mapDataModel
+                val robotId = r.serialNumber ?: "unknown"
+                if (r.checkSelfPermission(Permission.MAP) != Permission.GRANTED) return
+
+                val currentMapData = r.getMapData() ?: return
+                if (currentMapData.mapId.isEmpty()) return
+
+                val mapImage = currentMapData.mapImage
+                if (mapImage.data.isEmpty()) return
+
+                // GZIP compress the raw occupancy grid
+                val compressedData = compressGzip(mapImage.data)
                 
-                if (cachedMapData == null) {
-                    // Try getMapData() first
-                    cachedMapData = r.getMapData()
-                    Log.d(TAG, "getMapData() returned: ${if (cachedMapData != null) "map ${cachedMapData.mapImage.cols}x${cachedMapData.mapImage.rows}" else "null"}")
-                }
+                // Get map info
+                val mapInfo = currentMapData.mapInfo
                 
-                // Still null — enumerate maps and load by ID (matching working temi-mqtt-bridge pattern)
-                if (cachedMapData == null) {
-                    try {
-                        val mapList = r.getMapList()
-                        Log.d(TAG, "getMapList() returned ${mapList.size} maps")
-                        if (mapList.isNotEmpty()) {
-                            mapList.forEach { m ->
-                                Log.d(TAG, "Map entry: name='${m.name}', id='${m.id}'")
-                            }
-                            // Try to find target map by name, otherwise use first
-                            val target = mapList.find { it.name.equals(TARGET_MAP_NAME, ignoreCase = true) } ?: mapList.first()
-                            Log.d(TAG, "Loading map: '${target.name}' (id='${target.id}')")
-                            r.loadMap(target.id, false, null)
-                            // Wait for SDK to process
-                            Thread.sleep(2000)
-                            cachedMapData = r.getMapData()
-                            Log.d(TAG, "getMapData() after loadMap: ${if (cachedMapData != null) "map ${cachedMapData.mapImage.cols}x${cachedMapData.mapImage.rows}" else "null"}")
-                        } else {
-                            Log.w(TAG, "SDK getMapList() is empty")
-                        }
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Error enumerating/loading maps: ${e.message}")
-                    }
-                }
-                
-                // Cache the model for future use
-                if (cachedMapData != null) {
-                    this.mapDataModel = cachedMapData
-                    Log.d(TAG, "Map data loaded: ${cachedMapData.mapImage.cols}x${cachedMapData.mapImage.rows}")
-                }
-                
-                if (cachedMapData == null) {
-                    Log.w(TAG, "Still no map data after loadMap attempt")
-                    return
-                }
-                
-                val mapImage = cachedMapData.mapImage
-                
-                // Compute world coordinate bounds from Floor locations
-                // Try getCurrentFloor() first, fall back to individual location lookups
-                val currentFloor = r.getCurrentFloor()
-                var boundsMinX: Float? = null
-                var boundsMinY: Float? = null
-                var boundsMaxX: Float? = null
-                var boundsMaxY: Float? = null
-                
-                if (currentFloor != null && currentFloor.locations.isNotEmpty()) {
-                    val xs = currentFloor.locations.map { it.x }
-                    val ys = currentFloor.locations.map { it.y }
-                    boundsMinX = xs.minOrNull()
-                    boundsMinY = ys.minOrNull()
-                    boundsMaxX = xs.maxOrNull()
-                    boundsMaxY = ys.maxOrNull()
-                    Log.d(TAG, "Floor bounds: [$boundsMinX,$boundsMinY]-[$boundsMaxX,$boundsMaxY]")
-                } else {
-                    // Fallback: get bounds from individual location lookups via ContentProvider
-                    try {
-                        val locationNames = r.locations
-                        if (locationNames.isNotEmpty()) {
-                            val xs = mutableListOf<Float>()
-                            val ys = mutableListOf<Float>()
-                            for (name in locationNames) {
-                                val uri = android.net.Uri.parse("content://com.robotemi.sdk.provider/map/location")
-                                contentResolver.query(
-                                    uri, arrayOf("x", "y"), "name = ?", arrayOf(name), null
-                                )?.use { cursor ->
-                                    if (cursor.moveToFirst()) {
-                                        val xIdx = cursor.getColumnIndex("x")
-                                        val yIdx = cursor.getColumnIndex("y")
-                                        if (xIdx >= 0) xs.add(cursor.getFloat(xIdx))
-                                        if (yIdx >= 0) ys.add(cursor.getFloat(yIdx))
-                                    }
-                                }
-                            }
-                            if (xs.isNotEmpty()) {
-                                boundsMinX = xs.minOrNull()
-                                boundsMinY = ys.minOrNull()
-                                boundsMaxX = xs.maxOrNull()
-                                boundsMaxY = ys.maxOrNull()
-                                Log.d(TAG, "ContentProvider-based bounds: [$boundsMinX,$boundsMinY]-[$boundsMaxX,$boundsMaxY]")
-                            }
-                        }
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Failed to compute bounds from ContentProvider: ${e.message}")
-                    }
-                }
-                
-                // Convert map data to bitmap
-                val bitmap = Bitmap.createBitmap(
-                    mapImage.data.map { android.graphics.Color.argb((it * 2.55).toInt(), 0, 0, 0) }.toIntArray(),
+                mqttService?.publishMap(
+                    robotId,
+                    compressedData,
                     mapImage.cols,
                     mapImage.rows,
-                    Bitmap.Config.ARGB_8888
+                    mapInfo.resolution,
+                    mapInfo.originX,
+                    mapInfo.originY
                 )
-                
-                // Convert bitmap to base64 PNG
-                val stream = ByteArrayOutputStream()
-                bitmap.compress(Bitmap.CompressFormat.PNG, 100, stream)
-                val byteArray = stream.toByteArray()
-                val base64Image = Base64.encodeToString(byteArray, Base64.NO_WRAP)
-                
-                mqttService?.publishMap(base64Image, bitmap.width, bitmap.height, boundsMinX, boundsMinY, boundsMaxX, boundsMaxY)
-                Log.d(TAG, "Map published: ${bitmap.width}x${bitmap.height}")
-                
-                // Recycle bitmap to free memory
-                bitmap.recycle()
+                Log.d(TAG, "Map published successfully (GZIP)")
             } catch (e: Exception) {
-                Log.e(TAG, "Error publishing map data: ${e.message}")
+                Log.e(TAG, "Error in publishMapData", e)
             }
         }
     }
-    
+
     private fun publishRobotData() {
         robot?.let { r ->
             try {
-                // Publish TEMI robot battery (not tablet battery)
+                val robotId = r.serialNumber ?: "unknown"
                 val batteryData = r.batteryData
                 if (batteryData != null) {
-                    val batteryPct = batteryData.level
-                    val isCharging = batteryData.isCharging
-                    mqttService?.publishBattery(batteryPct, isCharging)
-                    Log.d(TAG, "Published TEMI battery: $batteryPct%, charging=$isCharging")
+                    mqttService?.publishBattery(robotId, batteryData.level, batteryData.isCharging)
                 } else {
-                    // Fallback to tablet battery if TEMI battery unavailable
                     val batteryIntent = registerReceiver(null, android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED))
                     val level = batteryIntent?.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL, -1) ?: -1
                     val scale = batteryIntent?.getIntExtra(android.os.BatteryManager.EXTRA_SCALE, -1) ?: -1
@@ -1014,10 +875,8 @@ class MainActivity : AppCompatActivity() {
                     val status = batteryIntent?.getIntExtra(android.os.BatteryManager.EXTRA_STATUS, -1) ?: -1
                     val isCharging = status == android.os.BatteryManager.BATTERY_STATUS_CHARGING || 
                                      status == android.os.BatteryManager.BATTERY_STATUS_FULL
-                    mqttService?.publishBattery(batteryPct, isCharging)
-                    Log.d(TAG, "Published tablet battery (fallback): $batteryPct%")
+                    mqttService?.publishBattery(robotId, batteryPct, isCharging)
                 }
-                
             } catch (e: Exception) {
                 Log.e(TAG, "Error publishing robot data", e)
             }
@@ -1028,7 +887,8 @@ class MainActivity : AppCompatActivity() {
     private val positionListener = object : com.robotemi.sdk.navigation.listener.OnCurrentPositionChangedListener {
         override fun onCurrentPositionChanged(position: com.robotemi.sdk.navigation.model.Position) {
             try {
-                mqttService?.publishPosition(position.x, position.y, position.yaw)
+                val robotId = robot?.serialNumber ?: "unknown"
+                mqttService?.publishPosition(robotId, position.x, position.y, position.yaw)
                 Log.d(TAG, "Position published: x=${position.x}, y=${position.y}, yaw=${position.yaw}")
             } catch (e: Exception) {
                 Log.e(TAG, "Error publishing position", e)
@@ -1036,6 +896,24 @@ class MainActivity : AppCompatActivity() {
         }
     }
     
+    // Map name listener to clear cache and republish
+    private val mapNameListener = object : com.robotemi.sdk.map.OnMapNameChangedListener {
+        override fun onMapNameChanged(mapName: String) {
+            Log.d(TAG, "Map name changed to $mapName, republishing")
+            publishMapData()
+            // Also refresh locations since they are map-dependent
+            robot?.let { publishLocationsWithCoordinates(it) }
+        }
+    }
+
+    // Map elements listener to republish when locations/walls change
+    private val mapElementsListener = object : com.robotemi.sdk.map.OnMapElementsChangedListener {
+        override fun onMapElementsChanged() {
+            Log.d(TAG, "Map elements changed, republishing locations")
+            robot?.let { publishLocationsWithCoordinates(it) }
+        }
+    }
+
     // Locations listener for MQTT publishing
     private val locationsListener = object : com.robotemi.sdk.listeners.OnLocationsUpdatedListener {
         override fun onLocationsUpdated(locations: List<String>) {
@@ -1100,6 +978,8 @@ class MainActivity : AppCompatActivity() {
         stopPeriodicPublishing()
         robot?.removeOnCurrentPositionChangedListener(positionListener)
         robot?.removeOnLocationsUpdateListener(locationsListener)
+        robot?.removeOnMapNameChangedListener(mapNameListener)
+        robot?.removeOnMapElementsChangedListener(mapElementsListener)
         robot?.removeOnGoToLocationStatusChangedListener(goToStatusListener)
         unbindService(serviceConnection)
     }
