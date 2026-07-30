@@ -28,14 +28,13 @@ class MqttService : Service() {
     companion object {
         const val CHANNEL_ID = "TemiMqttChannel"
         const val NOTIFICATION_ID = 1
-        val CLIENT_ID = "temi-controller-" + System.currentTimeMillis()
-        const val COMMAND_TOPIC = "temi/commands"
-        const val STATUS_TOPIC = "temi/status"
-        const val LOCATIONS_TOPIC = "temi/locations"
-        const val POSITION_TOPIC = "temi/position"
-        const val MAP_TOPIC = "temi/map"
-        const val VIRTUAL_WALLS_TOPIC = "temi/virtual_walls"
-        const val BATTERY_TOPIC = "temi/battery"
+        const val COMMAND_TOPIC = "temi_commands"
+        const val STATUS_TOPIC = "temi_status"
+        const val LOCATIONS_TOPIC = "temi_locations"
+        const val POSITION_TOPIC = "temi_position"
+        const val MAP_TOPIC = "temi_map"
+        const val VIRTUAL_WALLS_TOPIC = "temi_virtual_walls"
+        const val BATTERY_TOPIC = "temi_battery"
     }
     
     private var brokerUrl = "tcp://192.168.1.1:1883"
@@ -91,11 +90,16 @@ class MqttService : Service() {
     private fun connectToMqtt() {
         Thread {
             try {
-                mqttClient = MqttClient(brokerUrl, CLIENT_ID, MemoryPersistence())
+                // Use robot serial number for a persistent, unique Client ID
+                val robot = com.robotemi.sdk.Robot.getInstance()
+                val serialNumber = robot.serialNumber ?: "unknown-temi"
+                val persistentClientId = "temi-controller-$serialNumber"
+                
+                mqttClient = MqttClient(brokerUrl, persistentClientId, MemoryPersistence())
                 
                 val options = MqttConnectOptions().apply {
                     isAutomaticReconnect = true
-                    isCleanSession = true
+                    isCleanSession = false
                     connectionTimeout = 10
                     keepAliveInterval = 20
                 }
@@ -157,15 +161,29 @@ class MqttService : Service() {
             Log.e("MQTT", "Error handling message", e)
         }
     }
-    
+
     private fun publishStatus(status: String) {
         val client = mqttClient
         if (client == null || !client.isConnected) return
         try {
-            val message = MqttMessage(status.toByteArray())
+            // 1. Get the robot instance and serial number
+            val robot = com.robotemi.sdk.Robot.getInstance()
+            val robotId = robot.serialNumber ?: "unknown-temi"
+
+            // 2. Build the JSON payload
+            val json = JSONObject()
+            json.put("type", "status_update")
+            json.put("robotId", robotId)
+            json.put("status", status)
+            json.put("timestamp", System.currentTimeMillis())
+
+            // 3. Publish as JSON bytes
+            val message = MqttMessage(json.toString().toByteArray())
             client.publish(STATUS_TOPIC, message)
+
+            Log.d("MQTT", "Published status JSON: $status")
         } catch (e: Exception) {
-            Log.e("MQTT", "Failed to publish status", e)
+            Log.e("MQTT", "Failed to publish status JSON", e)
         }
     }
     

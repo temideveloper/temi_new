@@ -42,15 +42,14 @@ class MainActivity : AppCompatActivity() {
     private var publishRunnable: Runnable? = null
     private val PUBLISH_INTERVAL_MS = 3000L
 
-    // Position publisher (every 5 seconds to distinguish from saved locations)
+    // Position publisher (every 2 seconds)
     private var positionHandler: Handler? = null
     private var positionRunnable: Runnable? = null
-    private val POSITION_PUBLISH_INTERVAL_MS = 5000L
+    private val POSITION_PUBLISH_INTERVAL_MS = 2000L
 
-    // Map publisher (less frequent)
+    // Map publisher (event-driven)
     private var mapHandler: Handler? = null
     private var mapRunnable: Runnable? = null
-    private val MAP_PUBLISH_INTERVAL_MS = 2000L  // Every 2 seconds
 
     companion object {
         const val TAG = "TemiFace"
@@ -80,10 +79,11 @@ class MainActivity : AppCompatActivity() {
             startPositionPublishing()
             startMapPublishing()
             
-            // Publish locations after MQTT connects (with a small delay to allow map to load)
+            // Publish data after MQTT connects (with a small delay to allow map to load)
             mqttService?.onMqttConnected = {
                 Handler(mainLooper).postDelayed({
                     robot?.let { r ->
+                        publishMapData()
                         publishLocationsWithCoordinates(r)
                     }
                 }, 2000) // 2 second delay for map initialization
@@ -782,16 +782,10 @@ class MainActivity : AppCompatActivity() {
     }
     
     private fun startMapPublishing() {
-        mapHandler = Handler(mainLooper)
-        mapRunnable = object : Runnable {
-            override fun run() {
-                publishMapData()
-                mapHandler?.postDelayed(this, MAP_PUBLISH_INTERVAL_MS)
-            }
-        }
-        // Delayed start to give SDK time to initialize
-        mapHandler?.postDelayed(mapRunnable!!, 5000)
-        Log.d(TAG, "Map publishing scheduled with 5s delay")
+        // We no longer publish map periodically. 
+        // Initial publish is handled in onMqttConnected.
+        // Subsequent updates are handled by listeners.
+        Log.d(TAG, "Map publishing initialized (event-driven)")
     }
     
     private fun startPositionPublishing() {
