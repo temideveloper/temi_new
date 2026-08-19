@@ -88,6 +88,12 @@ class MqttService : Service() {
     }
     
     private fun connectToMqtt() {
+        // Prevent multiple simultaneous connection attempts
+        if (mqttClient?.isConnected == true && mqttClient?.serverURI == brokerUrl) {
+            Log.d("MQTT", "Already connected to $brokerUrl. Skipping redundant connection.")
+            return
+        }
+
         Thread {
             try {
                 // Use robot serial number for a persistent, unique Client ID
@@ -95,7 +101,17 @@ class MqttService : Service() {
                 val serialNumber = robot.serialNumber ?: "unknown-temi"
                 val persistentClientId = "temi-controller-$serialNumber"
                 
-                mqttClient = MqttClient(brokerUrl, persistentClientId, MemoryPersistence())
+                Log.d("MQTT", "Attempting connection to $brokerUrl with Client ID: $persistentClientId")
+                
+                // If broker URL changed, we must recreate the client
+                if (mqttClient != null && mqttClient?.serverURI != brokerUrl) {
+                    try { mqttClient?.disconnect(); mqttClient?.close() } catch (e: Exception) {}
+                    mqttClient = null
+                }
+
+                if (mqttClient == null) {
+                    mqttClient = MqttClient(brokerUrl, persistentClientId, MemoryPersistence())
+                }
                 
                 val options = MqttConnectOptions().apply {
                     isAutomaticReconnect = true
